@@ -262,8 +262,8 @@ class SeasonalEKF12D:
         # Матрица шума процесса Q (Ультра-жесткая настройка для стабильности)
         self.Q = np.zeros((12, 12))
         for i in range(3):
-            self.Q[i, i] = 1e-12       # Шум позиции
-            self.Q[i+3, i+3] = 1e-16   # Тектоническая скорость (почти константа)
+            self.Q[i, i] = 1e-10       # Шум позиции
+            self.Q[i+3, i+3] = 1e-13   # Тектоническая скорость (почти константа)
             # Шум сезонности (только если она активна)
             self.Q[i+6, i+6] = 1e-13 if self.P[i+6, i+6] > 0 else 0.0
             self.Q[i+9, i+9] = 1e-13 if self.P[i+9, i+9] > 0 else 0.0
@@ -391,7 +391,7 @@ class GeodeticEngine:
                 ekf = SeasonalEKF12D(dt_med, x0)
                 
                 for i in range(st, end):
-                    R_obs = np.diag(s[i]**2) + np.eye(3) * 0.007**2 
+                    R_obs = np.diag(s[i]**2) + np.eye(3) * 0.002**2 
                     ekf.predict()
                     y_res, full_pt, trend_pt = ekf.update(m[i], R_obs, t[i])
                     
