@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>GARD-2025: Advanced Geodetic Platform</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css"/>
+    <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
+
+    <style>
+        *, *::before, *::after { box-sizing: border-box; }
+        body { margin: 0; font-family: 'Segoe UI', sans-serif; display: flex; height: 100vh; }
+        #sidebar { width: 350px; background: #f8f9fa; padding: 20px; box-shadow: 2px 0 5px rgba(0,0,0,0.1); z-index: 1000; overflow-y: auto; }
+        #map { flex-grow: 1; }
+        h2 { margin-top: 0; color: #2c3e50; font-size: 20px; }
+        .control-group { margin-bottom: 15px; background: white; padding: 12px; border-radius: 6px; border: 1px solid #ddd; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; font-size: 13px; }
+        input, select { width: 100%; padding: 6px; margin-bottom: 8px; border: 1px solid #ccc; border-radius: 4px; }
+        button { width: 100%; padding: 10px; background: #3498db; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+        button:hover { background: #2980b9; }
+        button:disabled { background: #bdc3c7; cursor: not-allowed; }
+
+        .legend { background: white; padding: 10px; border-radius: 5px; box-shadow: 0 0 15px rgba(0,0,0,0.2); font-size: 12px; line-height: 1.8; color: #333; }
+        .color-scale { width: 180px; height: 14px; background: linear-gradient(to right, #2166ac, #f7f7f7, #b2182b); border: 1px solid #ccc; margin: 4px 0; border-radius: 2px; }
+        .scale-labels { display: flex; justify-content: space-between; font-size: 10px; font-weight: bold; }
+
+        /* ── Попап ─────────────────────────────────────────────────── */
+        .leaflet-popup-content-wrapper { width: 340px !important; }
+        .popup-title {
+            font-size: 15px; font-weight: bold;
+            border-bottom: 1px solid #eee; padding-bottom: 6px; margin-bottom: 8px;
+            display: flex; justify-content: space-between; align-items: center;
+        }
+        .popup-coords {
+            font-family: monospace; font-size: 12px;
+            background: #f4f4f4; padding: 7px; border-radius: 4px; line-height: 1.8;
+        }
+        .popup-footer {
+            margin-top: 10px; display: flex; gap: 8px;
+        }
+        .popup-btn {
+            flex: 1; padding: 7px 0; border: none; border-radius: 5px;
+            font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.15s;
+        }
+        .popup-btn-detail {
+            background: #1d4ed8; color: white;
+        }
+        .popup-btn-detail:hover { background: #1e40af; }
+
+        #loading { display: none; text-align: center; margin-top: 10px; color: #e67e22; font-weight: bold; }
+        .warn-box { background: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; padding: 7px 10px; font-size: 12px; margin-top: 8px; }
+    </style>
+</head>
+<body>
+
+<div id="sidebar">
+    <h2>🌍 GARD-Analytics Pro</h2>
+
+    <div class="control-group">
+        <label>1. Выделите регион (BBox)</label>
+        <input type="text" id="bbox_display" placeholder="Нарисуйте прямоугольник..." readonly>
+    </div>
+
+    <div class="control-group">
+        <label>2. Математические параметры</label>
+
+        <label>Лимит обработки (0 = все станции):</label>
+        <input type="number" id="process_limit" value="0" min="0">
+
+        <label>Целевая эпоха (год):</label>
+        <input type="number" id="target_epoch" value="2020.0" step="0.1">
+
+        <label>Размер опорной сети (K-Means кластеров):</label>
+        <input type="number" id="target_count" value="15" min="3" max="60">
+
+        <label>Система отсчёта скоростей:</label>
+        <select id="vel_mode" onchange="drawMapLayers()">
+            <option value="plate">Plate-Fixed (внутренние деформации)</option>
+            <option value="global">IGS20 (глобальная кинематика)</option>
+        </select>
+    </div>
+
+    <button id="calc_btn" onclick="runAnalysis()">🚀 Рассчитать модель</button>
+    <div id="loading">
+        ⏳ Идёт параллельный анализ…
+        <br><span style="font-size:11px;color:#7f8c8d;">(Может занять несколько минут)</span>
+    </div>
+
+    <div class="control-group" id="results_panel" style="display:none; margin-top:15px; background:#e8f8f5;">
+        <label>Результаты анализа:</label>
+        <div id="stats" style="font-size:13px; line-height:1.7;"></div>
+    </div>
+</div>
+
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+
+<script>
+// ── Инициализация карты ────────────────────────────────────────────────────
+var map = L.map('map').setView([36.0, 138.0], 5);
+L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+    attribution: '© OpenStreetMap & CARTO'
+}).addTo(map);
+
+var allStationsLayer = L.featureGroup();
+var refNetworkLayer  = L.featureGroup().addTo(map);
+var vectorsLayer     = L.featureGroup().addTo(map);
+var strainLayer      = L.featureGroup().addTo(map);
+var drawnItems       = new L.FeatureGroup().addTo(map);
+
+L.control.layers(null, {
+    "Тепловая карта (Strain)":  strainLayer,
+    "Вектора скоростей":        vectorsLayer,
+    "Опорная сеть (Лучшие)":    refNetworkLayer,
+    "Все обработанные станции": allStationsLayer
+}, { collapsed: false }).addTo(map);
+
+var drawControl = new L.Control.Draw({
+    draw: { polygon:false, marker:false, circle:false, circlemarker:false, polyline:false, rectangle:true },
+    edit: { featureGroup: drawnItems }
+});
+map.addControl(drawControl);
+
+var currentBbox = null;
+var currentData = null;
+
+map.on(L.Draw.Event.CREATED, function(e) {
+    drawnItems.clearLayers();
+    drawnItems.addLayer(e.layer);
+    var b = e.layer.getBounds();
+    currentBbox = [b.getSouth(), b.getNorth(), b.getWest(), b.getEast()];
+    document.getElementById('bbox_display').value = currentBbox.map(x => x.toFixed(2)).join(', ');
+});
+
+// ── Открытие страницы детального отчёта ───────────────────────────────────
+function openStationDetail(station) {
+    // Кладём данные в sessionStorage и открываем новую вкладку
+    const payload = {
+        station: station,
+        meta:    currentData.meta
+    };
+    sessionStorage.setItem('jgrf_station_detail', JSON.stringify(payload));
+    window.open('/station_detail', '_blank');
+}
+
+// ── Запуск расчёта ─────────────────────────────────────────────────────────
+async function runAnalysis() {
+    if (!currentBbox) { alert("Сначала выделите регион на карте!"); return; }
+
+    document.getElementById('calc_btn').disabled = true;
+    document.getElementById('loading').style.display = 'block';
+    document.getElementById('results_panel').style.display = 'none';
+
+    try {
+        const resp = await fetch('/calculate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                bbox:          currentBbox,
+                count:         document.getElementById('target_count').value,
+                epoch:         document.getElementById('target_epoch').value,
+                process_limit: document.getElementById('process_limit').value
+            })
+        });
+        const res = await resp.json();
+        if (res.status === 'success') {
+            currentData = res.data;
+            updateStats();
+            drawMapLayers();
+            updateLegend();
+        } else { alert("Ошибка: " + res.message); }
+    } catch(e) {
+        alert("Ошибка соединения с сервером.");
+    }
+    document.getElementById('calc_btn').disabled = false;
+    document.getElementById('loading').style.display = 'none';
+}
+
+// ── Статистика в сайдбаре ──────────────────────────────────────────────────
+function updateStats() {
+    document.getElementById('results_panel').style.display = 'block';
+    const m = currentData.meta;
+    const p = m.euler_pole;
+
+    let eulerWarn = '';
+    if (m.euler_valid === false) {
+        eulerWarn = `<div class="warn-box">
+            ⚠️ Полюс Эйлера ненадёжен — регион пересекает границу плит.
+            Plate-Fixed скорости могут быть некорректны.
+        </div>`;
+    }
+
+    document.getElementById('stats').innerHTML = `
+        <b>Обработано:</b> ${m.processed} станций<br>
+        <b>Опорная сеть:</b> ${currentData.ref_network_ids.length} станций<br>
+        <b>Треугольников:</b> ${currentData.triangles.length}<br>
+        <b>Время расчёта:</b> ${m.time_sec} сек<br>
+        <b>Тект. зона:</b> ${m.zone_name}<br>
+        <b>Вектор Эйлера (deg/Myr):</b><br>
+        &nbsp; X: ${p[0].toFixed(4)}<br>
+        &nbsp; Y: ${p[1].toFixed(4)}<br>
+        &nbsp; Z: ${p[2].toFixed(4)}
+        ${eulerWarn}
+    `;
+}
+
+// ── Цвет треугольника (синий=сжатие, красный=растяжение) ──────────────────
+function strainColor(val, sMax) {
+    const t = Math.max(-1, Math.min(1, val / Math.max(sMax, 1)));
+    if (t >= 0) {
+        return `rgba(255,${Math.round(247*(1-t))},${Math.round(247*(1-t))},0.72)`;
+    } else {
+        return `rgba(${Math.round(247*(1+t))},${Math.round(247*(1+t))},255,0.72)`;
+    }
+}
+
+// ── Отрисовка слоёв ────────────────────────────────────────────────────────
+function drawMapLayers() {
+    if (!currentData) return;
+    allStationsLayer.clearLayers();
+    refNetworkLayer.clearLayers();
+    vectorsLayer.clearLayers();
+    strainLayer.clearLayers();
+
+    const mode   = document.getElementById('vel_mode').value;
+    const refSet = new Set(currentData.ref_network_ids);
+    const sMax   = currentData.meta.strain_max;
+
+    // Треугольники
+    currentData.triangles.forEach(tri => {
+        const val = tri.strain;
+        L.polygon(tri.coords.map(c => [c[1], c[0]]), {
+            color: '#555', weight: 0.4,
+            fillColor: strainColor(val, sMax), fillOpacity: 0.72
+        })
+        .addTo(strainLayer)
+        .bindTooltip(`Дилатация: ${val.toFixed(1)} нстрейн/год`);
+    });
+
+    // Адаптивный масштаб стрелок
+    const velKey_e = mode === 'plate' ? 've_plate' : 've';
+    const velKey_n = mode === 'plate' ? 'vn_plate' : 'vn';
+    const speeds = currentData.stations
+        .map(s => Math.sqrt((s[velKey_e]||0)**2 + (s[velKey_n]||0)**2))
+        .filter(v => isFinite(v) && v < 500).sort((a,b) => a-b);
+    const p90 = speeds[Math.floor(speeds.length * 0.9)] || 10.0;
+    const arrowScale = Math.max(0.001, Math.min(0.05, 0.5 / Math.max(p90, 1)));
+
+    // Станции
+    currentData.stations.forEach(s => {
+        const isRef  = refSet.has(s.id);
+        const isWarn = s.is_precursor;
+        const color  = isWarn ? '#e74c3c' : (isRef ? '#2ecc71' : '#3498db');
+        const radius = (isRef || isWarn) ? 6 : 4;
+
+        // ── Попап: превью + кнопка детального отчёта ──────────────
+        const jumpStr = s.jumps > 0
+            ? `<span style="color:#e67e22;">⚡ Скачков: ${s.jumps}</span>`
+            : '✅ Скачков нет';
+        const epochStr = s.epoch_reliable
+            ? '✅ Данные у эпохи'
+            : `<span style="color:#e74c3c;">⚠️ Эпоха экстраполирована</span>`;
+
+        const popupContent = `
+            <div>
+                <div class="popup-title">
+                    <span>${s.id}</span>
+                    <span style="font-size:13px;">${isWarn ? '⚠️' : '✅'}</span>
+                </div>
+                <div class="popup-coords">
+                    Lat: ${s.lat.toFixed(4)}°&nbsp;&nbsp;Lon: ${s.lon.toFixed(4)}°<br>
+                    Ve: ${s.ve.toFixed(1)} мм/г&nbsp;&nbsp;Vn: ${s.vn.toFixed(1)} мм/г<br>
+                    RMSE: ${s.rmse.toFixed(2)} мм&nbsp;&nbsp;${jumpStr}<br>
+                    ${epochStr}
+                </div>
+                <div id="plot_${s.id}" style="width:100%;height:160px;margin-top:7px;"></div>
+                <div class="popup-footer">
+                    <button class="popup-btn popup-btn-detail"
+                        onclick="openStationDetail(currentData.stations.find(x=>x.id==='${s.id}'))">
+                        📊 Полный отчёт →
+                    </button>
+                </div>
+            </div>
+        `;
+
+        const marker = L.circleMarker([s.lat, s.lon], {
+            color: '#333', weight: 1,
+            fillColor: color, fillOpacity: 0.9, radius: radius
+        });
+
+        marker.bindPopup(popupContent, { maxWidth: 360 })
+              .on('popupopen', function() {
+            // Превью только X-компонента
+            Plotly.newPlot(`plot_${s.id}`, [
+                { x: s.graph.t, y: s.graph.raw_x, mode: 'markers', name: 'Raw',
+                  marker: { size: 2.5, color: '#aaa' } },
+                { x: s.graph.t, y: s.graph.filt_x, mode: 'lines', name: 'EKF',
+                  line: { color: '#2980b9', width: 1.8 } }
+            ], {
+                margin: { l:40, r:8, t:6, b:28 },
+                showlegend: false,
+                yaxis: { title: 'ΔX (м)', titlefont:{size:10}, tickfont:{size:9} },
+                xaxis: { tickfont:{size:9} },
+                paper_bgcolor:'white', plot_bgcolor:'#fafafa'
+            }, { displayModeBar: false });
+        });
+
+        if (isRef) marker.addTo(refNetworkLayer);
+        marker.addTo(allStationsLayer);
+
+        // Стрелка
+        const ve_a = s[velKey_e] || 0;
+        const vn_a = s[velKey_n] || 0;
+        if (!isFinite(ve_a) || Math.sqrt(ve_a**2+vn_a**2) > 300) return;
+
+        L.polyline(
+            [[s.lat, s.lon], [s.lat + vn_a*arrowScale, s.lon + ve_a*arrowScale]],
+            { color: '#1a1a1a', weight: 1.8, opacity: 0.85 }
+        ).addTo(vectorsLayer)
+         .bindTooltip(`${s.id}: Ve=${ve_a.toFixed(1)}, Vn=${vn_a.toFixed(1)} мм/год`);
+
+        L.circleMarker([s.lat + vn_a*arrowScale, s.lon + ve_a*arrowScale], {
+            radius: 2.5, color: '#1a1a1a', fillColor: '#1a1a1a', fillOpacity: 1, weight: 0
+        }).addTo(vectorsLayer);
+    });
+}
+
+// ── Легенда ────────────────────────────────────────────────────────────────
+var legendControl = L.control({ position: 'bottomright' });
+function updateLegend() {
+    if (legendControl.getContainer()) map.removeControl(legendControl);
+    legendControl.onAdd = function() {
+        const div    = L.DomUtil.create('div', 'legend');
+        const maxStr = currentData ? currentData.meta.strain_max.toFixed(0) : '100';
+        div.innerHTML = `
+            <b>Скорость дилатации (нстрейн/год)</b><br>
+            <div class="scale-labels">
+                <span>−${maxStr} (Сжатие)</span>
+                <span>0</span>
+                <span>+${maxStr} (Растяжение)</span>
+            </div>
+            <div class="color-scale"></div>
+            <hr style="margin:6px 0;">
+            <b>Типы станций:</b><br>
+            <span style="color:#2ecc71;font-size:16px;">●</span> Опорная сеть (K-Means)<br>
+            <span style="color:#3498db;font-size:16px;">●</span> Рядовая станция<br>
+            <span style="color:#e74c3c;font-size:16px;">●</span> <b>Аномалия / ненадёжная эпоха</b>
+        `;
+        return div;
+    };
+    legendControl.addTo(map);
+}
+updateLegend();
+</script>
+</body>
+</html>
