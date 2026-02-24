@@ -338,35 +338,27 @@ class GeodeticEngine:
         except: return False
 
     def _fetch_and_process(self, sid, target_epoch):
-        # Попытки загрузки для защиты от обрывов связи
-        r_text = None
-        for _ in range(3):
-            try:
-                r = requests.get(self.url_fmt.format(sid), timeout=10, verify=False)
-                if r.status_code == 200:
-                    r_text = r.text; break
-            except: time.sleep(1)
-        
-        if not r_text: return None
-
         try:
-            df_raw = pd.read_csv(io.StringIO(r_text), sep=r'\s+', header=None, usecols=range(9)).dropna()
+            r = requests.get(self.url_fmt.format(sid), timeout=10, verify=False, headers={'User-Agent': 'Mozilla/5.0'})
+            if r.status_code != 200: return None
+
+            df_raw = pd.read_csv(io.StringIO(r.text), sep=r'\s+', header=None, usecols=range(9)).dropna()
             df_raw.columns = ['site','date','t','x','y','z','sx','sy','sz']
 
-            # Проверка, попадает ли эпоха в диапазон данных
+            # Проверка: есть ли данные хотя бы близко к нужной эпохе?
             if df_raw.t.min() > target_epoch + 0.5 or df_raw.t.max() < target_epoch - 2.0:
                 return None
 
-            # Окно данных вокруг эпохи
+            # Вырезаем окно для фильтра Калмана (вокруг эпохи)
             df_w = df_raw[(df_raw.t >= target_epoch - 4.0) & (df_raw.t <= target_epoch + 1.5)]
             if len(df_w) < 80: return None
 
             t, m, s = df_w.t.values, df_w[['x','y','z']].values, df_w[['sx','sy','sz']].values
             
-            # Предварительная очистка от спайков (одиночных выбросов)
+            # Предварительная очистка от спайков
             t, m, s, _ = remove_spikes(t, m, s, window=7, k_mad=5.0)
 
-            # Скорости для стрелок (МНК с оценкой СКО через ковариационную матрицу)
+            # Скорости для стрелок (МНК)
             vels_lsq, sigma_vels = [], []
             for _ci in range(3):
                 try:
@@ -376,7 +368,7 @@ class GeodeticEngine:
                 except Exception:
                     vels_lsq.append(float(np.polyfit(t, m[:, _ci], 1)[0]))
                     sigma_vels.append(1e-4)
-            vx_r, vy_r, vz_r          = vels_lsq
+            vx_r, vy_r, vz_r = vels_lsq
             sigma_vx, sigma_vy, sigma_vz = sigma_vels
 
             # Детекция скачков
@@ -395,12 +387,10 @@ class GeodeticEngine:
             for (st, end) in segments:
                 if end - st < 15: continue
                 
-                # Умная инициализация с проверкой сезонности
                 x0 = _perfect_initialization_12d(t[st:end], m[st:end])
                 ekf = SeasonalEKF12D(dt_med, x0)
                 
                 for i in range(st, end):
-                    # Загрубляем R для стабильности
                     R_obs = np.diag(s[i]**2) + np.eye(3) * 0.007**2 
                     ekf.predict()
                     y_res, full_pt, trend_pt = ekf.update(m[i], R_obs, t[i])
@@ -414,73 +404,68 @@ class GeodeticEngine:
             res_arr, plot_arr, trend_arr = np.array(resids), np.array(plot_xyz), np.array(trend_xyz)
             rmse = float(np.sqrt(np.mean(res_arr**2)) * 1000)
 
-            # Координата на эпоху
-            dt_back = target_epoch - t[-1]
-            x_ep, y_ep, z_ep = (ekf.x[0:3] + ekf.x[3:6] * dt_back).tolist()
+            # --- ИСПРАВЛЕННЫЙ БЛОК НАДЕЖНОСТИ И ЭКСТРАПОЛЯЦИИ ---
+            
+            # Технический сдвиг для Калмана (от конца окна до эпохи)
+            dt_back_tech = target_epoch - t[-1]
+            
+            # Реальная экстраполяция (смотрит на ВСЕ данные станции, а не на окно)
+            # Если эпоха внутри ряда, экстраполяция = 0
+            dt_extrap_real = max(0, target_epoch - df_raw.t.max(), df_raw.t.min() - target_epoch)
+            
+            # Дыры вокруг целевой эпохи (+/- 1 год)
+            w_mask = np.abs(t - target_epoch) < 1.0
+            dt_gap = float(np.max(np.diff(t[w_mask]))) if w_mask.sum() > 2 else 9.9
+            
+            # Истинная надежность: не экстраполируем больше чем на год, нет огромных дыр
+            epoch_reliable = bool((dt_extrap_real < 1.0) and (dt_gap < 0.5))
+            
+            # Предвестник зажигаем только если с эпохой все ок, но шумит фильтр
+            is_precursor = bool(rmse > 15.0) if epoch_reliable else False
 
-            # СКО координат — из диагонали P с учётом экстраполяции (м -> мм)
-            sigma_x = float(np.sqrt(max(ekf.P[0,0] + ekf.P[3,3]*dt_back**2, 0)) * 1000)
-            sigma_y = float(np.sqrt(max(ekf.P[1,1] + ekf.P[4,4]*dt_back**2, 0)) * 1000)
-            sigma_z = float(np.sqrt(max(ekf.P[2,2] + ekf.P[5,5]*dt_back**2, 0)) * 1000)
+            # --- КОНЕЦ ИСПРАВЛЕНИЙ ---
+
+            # Координата на эпоху
+            x_ep, y_ep, z_ep = (ekf.x[0:3] + ekf.x[3:6] * dt_back_tech).tolist()
+
+            # СКО координат
+            sigma_x = float(np.sqrt(max(ekf.P[0,0] + ekf.P[3,3]*dt_back_tech**2, 0)) * 1000)
+            sigma_y = float(np.sqrt(max(ekf.P[1,1] + ekf.P[4,4]*dt_back_tech**2, 0)) * 1000)
+            sigma_z = float(np.sqrt(max(ekf.P[2,2] + ekf.P[5,5]*dt_back_tech**2, 0)) * 1000)
 
             # Геодезия + ENU
             lat, lon = geocentric_to_geodetic(x_ep, y_ep, z_ep)
             R_mat, v_enu = ecef_to_enu_vel(lat, lon, vx_r, vy_r, vz_r)
             ve, vn, vu = float(v_enu[0]), float(v_enu[1]), float(v_enu[2])
 
-            # СКО скоростей ENU: пропагация ковариационной матрицы МНК через R
-            # sigma_v_ecef — в м/год, sigma_v_enu тоже в м/год -> *1000 = мм/год
             sigma_v_ecef = np.array([sigma_vx, sigma_vy, sigma_vz])
             sigma_v_enu  = np.sqrt(np.maximum((R_mat ** 2) @ (sigma_v_ecef ** 2), 0))
 
-            # Надёжность эпохи: нет большой экстраполяции И нет пробелов в данных
-            w_mask = np.abs(t - target_epoch) < 1.5
-            if w_mask.sum() > 2:
-                dt_gap = float(np.max(np.diff(t[w_mask])))
-            else:
-                dt_gap = 9.9
-            epoch_reliable = bool(abs(dt_back) < 1.5 and dt_gap < 0.5)
-
-            # Годовая амплитуда из финального состояния EKF (sin²+cos²)½, мм
             amp_annual_x = float(np.sqrt(ekf.x[6]**2 + ekf.x[9]**2) * 1000)
 
-            # Формирование данных для графиков
             step = max(1, len(t) // 120)
             x0r, y0r, z0r = m[0, 0], m[0, 1], m[0, 2]
 
             return {
                 'id': sid, 'lat': lat, 'lon': lon,
                 'x': x_ep, 'y': y_ep, 'z': z_ep,
-                'sigma_x': round(sigma_x, 3),
-                'sigma_y': round(sigma_y, 3),
-                'sigma_z': round(sigma_z, 3),
-                've': round(ve * 1000, 3),
-                'vn': round(vn * 1000, 3),
-                'vu': round(vu * 1000, 3),
-                'sigma_ve': round(float(sigma_v_enu[0] * 1000), 3),
-                'sigma_vn': round(float(sigma_v_enu[1] * 1000), 3),
-                'sigma_vu': round(float(sigma_v_enu[2] * 1000), 3),
-                'rmse': round(rmse, 3),
-                'jumps': n_jumps,
-                'is_precursor': bool(rmse > 15.0 or not epoch_reliable),
+                'sigma_x': round(sigma_x, 3), 'sigma_y': round(sigma_y, 3), 'sigma_z': round(sigma_z, 3),
+                've': round(ve * 1000, 3), 'vn': round(vn * 1000, 3), 'vu': round(vu * 1000, 3),
+                'sigma_ve': round(float(sigma_v_enu[0] * 1000), 3), 'sigma_vn': round(float(sigma_v_enu[1] * 1000), 3), 'sigma_vu': round(float(sigma_v_enu[2] * 1000), 3),
+                'rmse': round(rmse, 3), 'jumps': n_jumps,
+                'is_precursor': is_precursor,
                 'epoch_reliable': epoch_reliable,
-                't_span_start': round(float(t.min()), 3),
-                't_span_end':   round(float(t.max()), 3),
+                't_span_start': round(float(df_raw.t.min()), 3), # Истинное начало
+                't_span_end':   round(float(df_raw.t.max()), 3), # Истинный конец
                 'n_obs':        int(len(t)),
                 'amp_annual_x': round(amp_annual_x, 3),
-                'dt_extrap':    round(float(dt_back), 3),
+                'dt_extrap':    round(float(dt_extrap_real), 3), # Истинная экстраполяция
                 'dt_gap':       round(float(dt_gap), 3),
                 'graph': {
                     't': t[::step].tolist(),
-                    'raw_x': (m[::step, 0] - x0r).tolist(),
-                    'filt_x': (plot_arr[::step, 0] - x0r).tolist(),
-                    'trend_x': (trend_arr[::step, 0] - x0r).tolist(),
-                    'raw_y': (m[::step, 1] - y0r).tolist(),
-                    'filt_y': (plot_arr[::step, 1] - y0r).tolist(),
-                    'trend_y': (trend_arr[::step, 1] - y0r).tolist(),
-                    'raw_z': (m[::step, 2] - z0r).tolist(),
-                    'filt_z': (plot_arr[::step, 2] - z0r).tolist(),
-                    'trend_z': (trend_arr[::step, 2] - z0r).tolist(),
+                    'raw_x': (m[::step, 0] - x0r).tolist(), 'filt_x': (plot_arr[::step, 0] - x0r).tolist(), 'trend_x': (trend_arr[::step, 0] - x0r).tolist(),
+                    'raw_y': (m[::step, 1] - y0r).tolist(), 'filt_y': (plot_arr[::step, 1] - y0r).tolist(), 'trend_y': (trend_arr[::step, 1] - y0r).tolist(),
+                    'raw_z': (m[::step, 2] - z0r).tolist(), 'filt_z': (plot_arr[::step, 2] - z0r).tolist(), 'trend_z': (trend_arr[::step, 2] - z0r).tolist(),
                 }
             }
         except Exception as e:
